@@ -24,6 +24,7 @@ public class OrderConsumerHostedService : BackgroundService
     private readonly CircuitBreakerOptions _circuitBreakerOptions;
     private readonly ResiliencePipeline<CreateOrderResult> _resiliencePipeline;
     private readonly JsonSerializerOptions _jsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private readonly object _channelLock = new();
     private IConnection? _connection;
     private IModel? _channel;
 
@@ -82,20 +83,49 @@ public class OrderConsumerHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await EnsureConnectionAsync(stoppingToken);
-        if (_channel == null) return;
+        // Retry until we have a channel (e.g. RabbitMQ not ready at startup in Docker)
+        while (_channel == null && !stoppingToken.IsCancellationRequested)
+        {
+            await EnsureConnectionAsync(stoppingToken);
+            if (_channel == null)
+            {
+                _logger.LogWarning("RabbitMQ connection failed. Retrying in 5s. Host={Host}:{Port} Queue={Queue}",
+                    _options.HostName, _options.Port, _options.OrderProcessingQueue);
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+        }
+
+        if (_channel == null)
+        {
+            _logger.LogError("Order consumer exiting: no RabbitMQ channel (cancelled or connection failed).");
+            return;
+        }
 
         var consumer = new AsyncEventingBasicConsumer(_channel);
         consumer.Received += async (_, ea) => await ProcessMessageAsync(ea, stoppingToken);
 
         _channel.BasicConsume(queue: _options.OrderProcessingQueue, autoAck: false, consumer: consumer);
-        _logger.LogInformation("Order consumer started, listening on {Queue}", _options.OrderProcessingQueue);
+        _logger.LogInformation("Order consumer started, listening on queue {Queue} (prefetch={Prefetch})",
+            _options.OrderProcessingQueue, _options.PrefetchCount);
 
         while (!stoppingToken.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
             if (_channel?.IsOpen != true)
+            {
+                _logger.LogWarning("Channel closed. Reconnecting to RabbitMQ...");
+                _channel = null;
+                _connection?.Close();
                 await EnsureConnectionAsync(stoppingToken);
+                if (_channel != null)
+                {
+                    _channel.BasicQos(prefetchSize: 0, prefetchCount: _options.PrefetchCount, global: false);
+                    var newConsumer = new AsyncEventingBasicConsumer(_channel);
+                    newConsumer.Received += async (_, ea) => await ProcessMessageAsync(ea, stoppingToken);
+                    _channel.BasicConsume(queue: _options.OrderProcessingQueue, autoAck: false, consumer: newConsumer);
+                    _logger.LogInformation("Order consumer reconnected, listening on {Queue}", _options.OrderProcessingQueue);
+                }
+            }
         }
     }
 
@@ -110,21 +140,32 @@ public class OrderConsumerHostedService : BackgroundService
                 UserName = _options.UserName,
                 Password = _options.Password,
                 VirtualHost = _options.VirtualHost,
-                AutomaticRecoveryEnabled = true
+                AutomaticRecoveryEnabled = true,
+                DispatchConsumersAsync = true
             };
+            _logger.LogInformation("Connecting to RabbitMQ at {Host}:{Port} vhost={VHost}...",
+                _options.HostName, _options.Port, _options.VirtualHost);
             _connection = factory.CreateConnection();
             _channel = _connection.CreateModel();
             RabbitMQQueueSetup.DeclareQueues(_channel, _options);
+            _channel.BasicQos(prefetchSize: 0, prefetchCount: _options.PrefetchCount, global: false);
+            _logger.LogInformation("Connected to RabbitMQ. Queue {Queue} declared and prefetch set to {Prefetch}.",
+                _options.OrderProcessingQueue, _options.PrefetchCount);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to connect to RabbitMQ. Retrying in 5s.");
+            _logger.LogError(ex, "Failed to connect to RabbitMQ at {Host}:{Port}. Will retry.",
+                _options.HostName, _options.Port);
+            _channel = null;
+            _connection?.Close();
             await Task.Delay(TimeSpan.FromSeconds(5), ct);
         }
     }
 
     private async Task ProcessMessageAsync(BasicDeliverEventArgs ea, CancellationToken ct)
     {
+        _logger.LogInformation("Consuming message from queue. DeliveryTag={DeliveryTag} BodyLength={Length}",
+            ea.DeliveryTag, ea.Body.Length);
         var body = Encoding.UTF8.GetString(ea.Body.ToArray());
         OrderReceivedEvent? evt = null;
         try
@@ -133,7 +174,7 @@ public class OrderConsumerHostedService : BackgroundService
             if (evt == null)
             {
                 _logger.LogWarning("Deserialized message is null. DeliveryTag={DeliveryTag}. Nacking.", ea.DeliveryTag);
-                _channel?.BasicNack(ea.DeliveryTag, false, false);
+                SafeNack(ea.DeliveryTag, false);
                 return;
             }
 
@@ -158,7 +199,7 @@ public class OrderConsumerHostedService : BackgroundService
         {
             if (evt != null)
                 _logger.LogWarning("Circuit breaker open. Requeuing message. MessageId={MessageId} CorrelationId={CorrelationId}", evt.MessageId, evt.CorrelationId);
-            _channel?.BasicNack(ea.DeliveryTag, false, true);
+            SafeNack(ea.DeliveryTag, true);
         }
         catch (Exception ex)
         {
@@ -199,13 +240,29 @@ public class OrderConsumerHostedService : BackgroundService
                         _logger.LogWarning("Message sent to retry queue. MessageId={MessageId} NextRetryCount={RetryCount}", evt.MessageId, retryCount + 1);
                     }
                 }
-                _channel?.BasicAck(ea.DeliveryTag, false);
+                SafeAck(ea.DeliveryTag);
             }
             catch (Exception ackEx)
             {
                 _logger.LogError(ackEx, "Failed to ack or publish to DLQ/retry. DeliveryTag={DeliveryTag}", ea.DeliveryTag);
-                _channel?.BasicNack(ea.DeliveryTag, false, true);
+                SafeNack(ea.DeliveryTag, true);
             }
+        }
+    }
+
+    private void SafeAck(ulong deliveryTag)
+    {
+        lock (_channelLock)
+        {
+            _channel?.BasicAck(deliveryTag, false);
+        }
+    }
+
+    private void SafeNack(ulong deliveryTag, bool requeue)
+    {
+        lock (_channelLock)
+        {
+            _channel?.BasicNack(deliveryTag, false, requeue);
         }
     }
 
@@ -244,7 +301,7 @@ public class OrderConsumerHostedService : BackgroundService
                 {
                     _logger.LogInformation("Order already exists (idempotent). OrderId={OrderId} MessageId={MessageId}", result.OrderId, evt.MessageId);
                 }
-                _channel?.BasicAck(ea.DeliveryTag, false);
+                SafeAck(ea.DeliveryTag);
                 return;
             }
 
@@ -261,11 +318,11 @@ public class OrderConsumerHostedService : BackgroundService
                     SourceQueue = _options.OrderProcessingQueue,
                     FailedAt = DateTime.UtcNow
                 }, ct);
-                _channel?.BasicAck(ea.DeliveryTag, false);
+                SafeAck(ea.DeliveryTag);
                 return;
             }
 
-            _channel?.BasicAck(ea.DeliveryTag, false);
+            SafeAck(ea.DeliveryTag);
         }
         catch (Exception ex)
         {
@@ -296,12 +353,12 @@ public class OrderConsumerHostedService : BackgroundService
                         await failurePublisher.PublishToRetryAsync(evt, retryCount + 1, ct);
                     }
                 }
-                _channel?.BasicAck(ea.DeliveryTag, false);
+                SafeAck(ea.DeliveryTag);
             }
             catch (Exception ackEx)
             {
                 _logger.LogError(ackEx, "Failed to ack or publish to DLQ/retry");
-                _channel?.BasicNack(ea.DeliveryTag, false, true);
+                SafeNack(ea.DeliveryTag, true);
             }
         }
     }

@@ -28,8 +28,45 @@ public class OrderProcessedConsumerService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await EnsureConnectionAsync(stoppingToken);
+        while (_channel == null && !stoppingToken.IsCancellationRequested)
+        {
+            await EnsureConnectionAsync(stoppingToken);
+            if (_channel == null)
+            {
+                _logger.LogWarning("RabbitMQ connection failed. Retrying in 5s. Host={Host}:{Port} Queue={Queue}",
+                    _options.HostName, _options.Port, _options.OrderProcessedQueue);
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+        }
+
+        if (_channel == null)
+        {
+            _logger.LogError("Notification consumer exiting: no RabbitMQ channel.");
+            return;
+        }
+
+        StartConsumer();
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+            if (_channel?.IsOpen != true)
+            {
+                _logger.LogWarning("Channel closed. Reconnecting to RabbitMQ...");
+                _channel = null;
+                _connection?.Close();
+                await EnsureConnectionAsync(stoppingToken);
+                if (_channel != null)
+                    StartConsumer();
+            }
+        }
+    }
+
+    private void StartConsumer()
+    {
         if (_channel == null) return;
+
+        _channel.BasicQos(prefetchSize: 0, prefetchCount: _options.PrefetchCount, global: false);
 
         var consumer = new EventingBasicConsumer(_channel);
         consumer.Received += (_, ea) =>
@@ -54,14 +91,8 @@ public class OrderProcessedConsumerService : BackgroundService
         };
 
         _channel.BasicConsume(queue: _options.OrderProcessedQueue, autoAck: false, consumer: consumer);
-        _logger.LogInformation("Notification consumer started, listening on {Queue}", _options.OrderProcessedQueue);
-
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
-            if (_channel?.IsOpen != true)
-                await EnsureConnectionAsync(stoppingToken);
-        }
+        _logger.LogInformation("Notification consumer started, listening on {Queue} (prefetch={Prefetch})",
+            _options.OrderProcessedQueue, _options.PrefetchCount);
     }
 
     private async Task EnsureConnectionAsync(CancellationToken ct)
@@ -77,14 +108,19 @@ public class OrderProcessedConsumerService : BackgroundService
                 VirtualHost = _options.VirtualHost,
                 AutomaticRecoveryEnabled = true
             };
+            _logger.LogInformation("Connecting to RabbitMQ at {Host}:{Port} vhost={VHost}...",
+                _options.HostName, _options.Port, _options.VirtualHost);
             _connection = factory.CreateConnection();
             _channel = _connection.CreateModel();
             RabbitMQQueueSetup.DeclareQueues(_channel, _options);
+            _logger.LogInformation("Connected to RabbitMQ. Queue {Queue} ready.", _options.OrderProcessedQueue);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to connect to RabbitMQ. Retrying in 5s.");
-            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            _logger.LogError(ex, "Failed to connect to RabbitMQ at {Host}:{Port}. Will retry.",
+                _options.HostName, _options.Port);
+            _channel = null;
+            _connection?.Close();
         }
     }
 

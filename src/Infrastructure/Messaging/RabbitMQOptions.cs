@@ -22,4 +22,6 @@ public class RabbitMQOptions
     /// <summary>Use exponential backoff for retry queue (per-message TTL). If false, RetryDelayMs is used.</summary>
     public bool RetryExponentialBackoff { get; set; } = true;
     public int MaxRetryCount { get; set; } = 3;
+    /// <summary>Max number of unacked messages per consumer (prefetch). Use 1 for strict ordering; higher for throughput.</summary>
+    public ushort PrefetchCount { get; set; } = 5;
 }
