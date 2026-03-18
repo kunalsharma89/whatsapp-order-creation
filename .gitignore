@@ -1,0 +1,40 @@
+# Build
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+*.cache
+*.dll
+*.pdb
+*.log
+*.vspscc
+*.vssscc
+.vs/
+*.pidb
+*.scc
+
+# NuGet
+packages/
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Logs
+logs/
+*.txt
+!docs/*.txt
+
+# IDE
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# User secrets
+secrets.json

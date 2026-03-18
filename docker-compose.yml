@@ -1,0 +1,91 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: whatsapp-order-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: whatsapp-order-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: WhatsAppOrders
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  webhook-service:
+    build:
+      context: ./src
+      dockerfile: WebhookService/Dockerfile
+    container_name: whatsapp-order-webhook
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=WhatsAppOrders;Username=postgres;Password=postgres"
+      RabbitMQ__HostName: rabbitmq
+      RabbitMQ__Port: "5672"
+      RabbitMQ__UserName: guest
+      RabbitMQ__Password: guest
+      RabbitMQ__VirtualHost: /
+      Webhook__VerifyToken: my-verify-token
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  order-processing-service:
+    build:
+      context: ./src
+      dockerfile: OrderProcessingService/Dockerfile
+    container_name: whatsapp-order-processor
+    environment:
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=WhatsAppOrders;Username=postgres;Password=postgres"
+      RabbitMQ__HostName: rabbitmq
+      RabbitMQ__Port: "5672"
+      RabbitMQ__UserName: guest
+      RabbitMQ__Password: guest
+      RabbitMQ__VirtualHost: /
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  notification-service:
+    build:
+      context: ./src
+      dockerfile: NotificationService/Dockerfile
+    container_name: whatsapp-order-notification
+    environment:
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=WhatsAppOrders;Username=postgres;Password=postgres"
+      RabbitMQ__HostName: rabbitmq
+      RabbitMQ__Port: "5672"
+      RabbitMQ__UserName: guest
+      RabbitMQ__Password: guest
+      RabbitMQ__VirtualHost: /
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

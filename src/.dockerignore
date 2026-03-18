@@ -1,0 +1,7 @@
+**/bin
+**/obj
+**/.vs
+**/.git
+**/logs
+**/*.user
+**/out

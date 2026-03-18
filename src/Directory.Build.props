@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <!-- Centralized target framework: change here to update all projects -->
+    <TargetFrameworkVersion>net10.0</TargetFrameworkVersion>
+    <TargetFramework>$(TargetFrameworkVersion)</TargetFramework>
+  </PropertyGroup>
+</Project>

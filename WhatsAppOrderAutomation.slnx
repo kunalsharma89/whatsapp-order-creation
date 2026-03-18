@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Application/Application.csproj" />
+    <Project Path="src/Domain/Domain.csproj" />
+    <Project Path="src/Infrastructure/Infrastructure.csproj" />
+    <Project Path="src/NotificationService/NotificationService.csproj" />
+    <Project Path="src/OrderProcessingService/OrderProcessingService.csproj" />
+    <Project Path="src/Shared.Contracts/Shared.Contracts.csproj" />
+    <Project Path="src/WebhookService/WebhookService.csproj" />
+  </Folder>
+</Solution>
