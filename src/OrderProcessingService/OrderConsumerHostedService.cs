@@ -268,46 +268,63 @@ public class OrderConsumerHostedService : BackgroundService
 
     private async Task ProcessOrderMessageAsync(OrderReceivedEvent evt, string body, BasicDeliverEventArgs ea, int retryCount, CancellationToken ct)
     {
+        using var scope = _scopeFactory.CreateScope();
+        var orderService = scope.ServiceProvider.GetRequiredService<IOrderService>();
+        var successPublisher = scope.ServiceProvider.GetRequiredService<IMessagePublisher>();
+        var failurePublisher = scope.ServiceProvider.GetRequiredService<IOrderFailurePublisher>();
+        var failedMessageRepo = scope.ServiceProvider.GetRequiredService<IFailedMessageRepository>();
+
+        CreateOrderResult result;
         try
         {
-
-            using var scope = _scopeFactory.CreateScope();
-            var orderService = scope.ServiceProvider.GetRequiredService<IOrderService>();
-            var successPublisher = scope.ServiceProvider.GetRequiredService<IMessagePublisher>();
-            var failurePublisher = scope.ServiceProvider.GetRequiredService<IOrderFailurePublisher>();
-            var failedMessageRepo = scope.ServiceProvider.GetRequiredService<IFailedMessageRepository>();
-
-            var result = await _resiliencePipeline.ExecuteAsync(async token =>
+            result = await _resiliencePipeline.ExecuteAsync(async token =>
                 await orderService.CreateOrderAsync(evt, token), ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Order creation failed. MessageId={MessageId} CorrelationId={CorrelationId}",
+                evt.MessageId, evt.CorrelationId);
+            await HandleProcessingFailureAsync(evt, ea, retryCount, ex, failurePublisher, failedMessageRepo, ct);
+            return;
+        }
 
-            if (result.Success)
+        if (result.Success)
+        {
+            _logger.LogInformation("Order saved to DB. OrderId={OrderId} MessageId={MessageId} IsDuplicate={IsDuplicate}",
+                result.OrderId, evt.MessageId, result.IsDuplicate);
+
+            if (result.OrderId.HasValue && !result.IsDuplicate)
             {
-                if (result.OrderId.HasValue && !result.IsDuplicate)
+                try
                 {
-                    var itemsSummary = string.Join(", ", evt.RawText);
                     await successPublisher.PublishOrderProcessedAsync(new OrderProcessedEvent
                     {
                         OrderId = result.OrderId.Value,
                         UserId = evt.UserId,
                         PhoneNumber = evt.PhoneNumber,
-                        ItemsSummary = itemsSummary,
+                        ItemsSummary = evt.RawText,
                         Status = "Processed",
                         CorrelationId = evt.CorrelationId
                     }, ct);
-                    _logger.LogInformation("Order created and notification published. OrderId={OrderId} MessageId={MessageId} IsDuplicate={IsDuplicate}",
-                        result.OrderId, evt.MessageId, result.IsDuplicate);
+                    _logger.LogInformation("Notification published. OrderId={OrderId}", result.OrderId);
                 }
-                else
+                catch (Exception pubEx)
                 {
-                    _logger.LogInformation("Order already exists (idempotent). OrderId={OrderId} MessageId={MessageId}", result.OrderId, evt.MessageId);
+                    _logger.LogWarning(pubEx, "Failed to publish notification (order already saved). OrderId={OrderId} MessageId={MessageId}",
+                        result.OrderId, evt.MessageId);
                 }
-                SafeAck(ea.DeliveryTag);
-                return;
             }
 
-            if (result.ErrorMessage != null)
+            SafeAck(ea.DeliveryTag);
+            return;
+        }
+
+        if (result.ErrorMessage != null)
+        {
+            _logger.LogWarning("Order validation/parse failed, sending to DLQ. MessageId={MessageId} Error={Error}",
+                evt.MessageId, result.ErrorMessage);
+            try
             {
-                _logger.LogWarning("Order validation/parse failed, sending to DLQ. MessageId={MessageId} Error={Error}", evt.MessageId, result.ErrorMessage);
                 await failurePublisher.PublishToDlqAsync(evt, result.ErrorMessage, ct);
                 await failedMessageRepo.AddAsync(new FailedMessage
                 {
@@ -318,48 +335,50 @@ public class OrderConsumerHostedService : BackgroundService
                     SourceQueue = _options.OrderProcessingQueue,
                     FailedAt = DateTime.UtcNow
                 }, ct);
-                SafeAck(ea.DeliveryTag);
-                return;
             }
+            catch (Exception dlqEx)
+            {
+                _logger.LogError(dlqEx, "Failed to publish to DLQ. MessageId={MessageId}", evt.MessageId);
+            }
+            SafeAck(ea.DeliveryTag);
+            return;
+        }
 
+        SafeAck(ea.DeliveryTag);
+    }
+
+    private async Task HandleProcessingFailureAsync(
+        OrderReceivedEvent evt, BasicDeliverEventArgs ea, int retryCount, Exception ex,
+        IOrderFailurePublisher failurePublisher, IFailedMessageRepository failedMessageRepo, CancellationToken ct)
+    {
+        try
+        {
+            if (retryCount >= _options.MaxRetryCount)
+            {
+                await failurePublisher.PublishToDlqAsync(evt, ex.Message, ct);
+                await failedMessageRepo.AddAsync(new FailedMessage
+                {
+                    Id = Guid.NewGuid(),
+                    MessageId = evt.MessageId,
+                    Payload = Encoding.UTF8.GetString(ea.Body.ToArray()),
+                    Error = ex.Message,
+                    SourceQueue = _options.OrderProcessingQueue,
+                    FailedAt = DateTime.UtcNow
+                }, ct);
+                _logger.LogError("Message sent to DLQ after max retries. MessageId={MessageId}", evt.MessageId);
+            }
+            else
+            {
+                await failurePublisher.PublishToRetryAsync(evt, retryCount + 1, ct);
+                _logger.LogWarning("Message sent to retry queue. MessageId={MessageId} NextRetryCount={RetryCount}",
+                    evt.MessageId, retryCount + 1);
+            }
             SafeAck(ea.DeliveryTag);
         }
-        catch (Exception ex)
+        catch (Exception ackEx)
         {
-            _logger.LogError(ex, "Error processing order message. MessageId={MessageId} CorrelationId={CorrelationId}", evt.MessageId, evt.CorrelationId);
-            try
-            {
-                if (evt != null)
-                {
-                    using var scope = _scopeFactory.CreateScope();
-                    var failurePublisher = scope.ServiceProvider.GetRequiredService<IOrderFailurePublisher>();
-                    var failedMessageRepo = scope.ServiceProvider.GetRequiredService<IFailedMessageRepository>();
-
-                    if (retryCount >= _options.MaxRetryCount)
-                    {
-                        await failurePublisher.PublishToDlqAsync(evt, ex.Message, ct);
-                        await failedMessageRepo.AddAsync(new FailedMessage
-                        {
-                            Id = Guid.NewGuid(),
-                            MessageId = evt.MessageId,
-                            Payload = Encoding.UTF8.GetString(ea.Body.ToArray()),
-                            Error = ex.Message,
-                            SourceQueue = _options.OrderProcessingQueue,
-                            FailedAt = DateTime.UtcNow
-                        }, ct);
-                    }
-                    else
-                    {
-                        await failurePublisher.PublishToRetryAsync(evt, retryCount + 1, ct);
-                    }
-                }
-                SafeAck(ea.DeliveryTag);
-            }
-            catch (Exception ackEx)
-            {
-                _logger.LogError(ackEx, "Failed to ack or publish to DLQ/retry");
-                SafeNack(ea.DeliveryTag, true);
-            }
+            _logger.LogError(ackEx, "Failed to ack or publish to DLQ/retry. DeliveryTag={DeliveryTag}", ea.DeliveryTag);
+            SafeNack(ea.DeliveryTag, true);
         }
     }
 
